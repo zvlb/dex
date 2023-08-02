@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"golang.org/x/oauth2"
@@ -24,6 +25,9 @@ const (
 	// used to retrieve groups from /oauth/userinfo
 	// https://docs.gitlab.com/ee/integration/openid_connect_provider.html
 	scopeOpenID = "openid"
+
+	// used to get user projects from /api/v4/projects
+	scopeReadApi = "read_api"
 )
 
 // Config holds configuration options for gitlab logins.
@@ -35,6 +39,7 @@ type Config struct {
 	Groups              []string `json:"groups"`
 	UseLoginAsID        bool     `json:"useLoginAsID"`
 	GetGroupsPermission bool     `json:"getGroupsPermission"`
+	GetRepos            bool     `json:"getRepos"`
 }
 
 type gitlabUser struct {
@@ -44,6 +49,12 @@ type gitlabUser struct {
 	State    string
 	Email    string
 	IsAdmin  bool
+}
+
+type gitlabProjects struct {
+	ID                int    `json:"id"`
+	Name              string `json:"name"`
+	PathWithNamespace string `json:"path_with_namespace"`
 }
 
 // Open returns a strategy for logging in through GitLab.
@@ -60,6 +71,7 @@ func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error)
 		groups:              c.Groups,
 		useLoginAsID:        c.UseLoginAsID,
 		getGroupsPermission: c.GetGroupsPermission,
+		getRepos:            c.GetRepos,
 	}, nil
 }
 
@@ -87,12 +99,18 @@ type gitlabConnector struct {
 
 	// if set to true permissions will be added to list of groups
 	getGroupsPermission bool
+
+	// if set to true permissions will be added to list of repos
+	getRepos bool
 }
 
 func (c *gitlabConnector) oauth2Config(scopes connector.Scopes) *oauth2.Config {
 	gitlabScopes := []string{scopeUser}
 	if c.groupsRequired(scopes.Groups) {
-		gitlabScopes = []string{scopeUser, scopeOpenID}
+		gitlabScopes = append(gitlabScopes, scopeOpenID)
+	}
+	if c.getRepos {
+		gitlabScopes = append(gitlabScopes, scopeReadApi)
 	}
 
 	gitlabEndpoint := oauth2.Endpoint{AuthURL: c.baseURL + "/oauth/authorize", TokenURL: c.baseURL + "/oauth/token"}
@@ -357,6 +375,14 @@ func (c *gitlabConnector) getGroups(ctx context.Context, client *http.Client, gr
 		return nil, err
 	}
 
+	if c.getRepos {
+		userRepos, err := c.setReposToGroups(ctx, client)
+		if err != nil {
+			return nil, err
+		}
+		gitlabGroups = append(gitlabGroups, userRepos...)
+	}
+
 	if len(c.groups) > 0 {
 		filteredGroups := groups.Filter(gitlabGroups, c.groups)
 		if len(filteredGroups) == 0 {
@@ -368,4 +394,79 @@ func (c *gitlabConnector) getGroups(ctx context.Context, client *http.Client, gr
 	}
 
 	return nil, nil
+}
+
+func (c *gitlabConnector) setReposToGroups(ctx context.Context, client *http.Client) ([]string, error) {
+	projects, totalPages, err := c.getUserRepos(ctx, client, 1)
+	if err != nil {
+		return nil, err
+	}
+
+	if totalPages > 1 {
+		var wg sync.WaitGroup
+		limit := make(chan struct{}, 10)
+		for p := 2; p <= totalPages; p++ {
+			wg.Add(1)
+			limit <- struct{}{}
+
+			go func(
+				ctx context.Context,
+				client *http.Client,
+				p int,
+			) {
+				defer func() {
+					wg.Done()
+					<-limit
+				}()
+
+				projectsPagination, _, _ := c.getUserRepos(ctx, client, p)
+
+				projects = append(projects, projectsPagination...)
+			}(ctx, client, p)
+
+		}
+		wg.Wait()
+	}
+
+	var projectsPath []string
+	for _, gp := range projects {
+		projectsPath = append(projectsPath, gp.PathWithNamespace)
+	}
+
+	return projectsPath, nil
+}
+
+func (c *gitlabConnector) getUserRepos(ctx context.Context, client *http.Client, page int) ([]gitlabProjects, int, error) {
+	var projects []gitlabProjects
+
+	url := fmt.Sprintf("%s/api/v4/projects?page=%+v", c.baseURL, page)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, 0, fmt.Errorf("gitlab: new req: %v", err)
+	}
+	req = req.WithContext(ctx)
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, 0, fmt.Errorf("gitlab: get URL %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, 0, fmt.Errorf("gitlab: read body: %v", err)
+		}
+		return nil, 0, fmt.Errorf("%s: %s", resp.Status, body)
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&projects); err != nil {
+		return nil, 0, fmt.Errorf("failed to decode response: %v", err)
+	}
+
+	totalPages, err := strconv.Atoi(resp.Header["X-Total-Pages"][0])
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return projects, totalPages, nil
 }
