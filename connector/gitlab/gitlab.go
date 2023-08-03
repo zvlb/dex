@@ -28,6 +28,9 @@ const (
 
 	// used to get user projects from /api/v4/projects
 	scopeReadApi = "read_api"
+
+	// Min Access Level for Gitlab Propects
+	gitlabMinAccessLevel = 30
 )
 
 // Config holds configuration options for gitlab logins.
@@ -439,7 +442,7 @@ func (c *gitlabConnector) setReposToGroups(ctx context.Context, client *http.Cli
 func (c *gitlabConnector) getUserRepos(ctx context.Context, client *http.Client, page int) ([]gitlabProjects, int, error) {
 	var projects []gitlabProjects
 
-	url := fmt.Sprintf("%s/api/v4/projects?page=%+v", c.baseURL, page)
+	url := fmt.Sprintf("%s/api/v4/projects?min_access_level=%+v&page=%+v", c.baseURL, gitlabMinAccessLevel, page)
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, 0, fmt.Errorf("gitlab: new req: %v", err)
