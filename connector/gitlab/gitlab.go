@@ -12,6 +12,7 @@ import (
 	"sync"
 	"time"
 
+	"golang.org/x/exp/slices"
 	"golang.org/x/oauth2"
 
 	"github.com/dexidp/dex/connector"
@@ -43,6 +44,7 @@ type Config struct {
 	UseLoginAsID        bool     `json:"useLoginAsID"`
 	GetGroupsPermission bool     `json:"getGroupsPermission"`
 	GetRepos            bool     `json:"getRepos"`
+	IgnoredReposForUser []string `json:"ignoredReposForUser"`
 }
 
 type gitlabUser struct {
@@ -75,6 +77,7 @@ func (c *Config) Open(id string, logger log.Logger) (connector.Connector, error)
 		useLoginAsID:        c.UseLoginAsID,
 		getGroupsPermission: c.GetGroupsPermission,
 		getRepos:            c.GetRepos,
+		ignoredReposForUser: c.IgnoredReposForUser,
 	}, nil
 }
 
@@ -105,6 +108,9 @@ type gitlabConnector struct {
 
 	// if set to true permissions will be added to list of repos
 	getRepos bool
+
+	// Wait fix for cookies count limits
+	ignoredReposForUser []string
 }
 
 func (c *gitlabConnector) oauth2Config(scopes connector.Scopes) *oauth2.Config {
@@ -379,11 +385,13 @@ func (c *gitlabConnector) getGroups(ctx context.Context, client *http.Client, gr
 	}
 
 	if c.getRepos {
-		userRepos, err := c.setReposToGroups(ctx, client)
-		if err != nil {
-			return nil, err
+		if !slices.Contains(c.ignoredReposForUser, userLogin) {
+			userRepos, err := c.setReposToGroups(ctx, client)
+			if err != nil {
+				return nil, err
+			}
+			gitlabGroups = append(gitlabGroups, userRepos...)
 		}
-		gitlabGroups = append(gitlabGroups, userRepos...)
 	}
 
 	if len(c.groups) > 0 {
